@@ -45,7 +45,7 @@ DATA_FILE = DATA_DIR / "arg_state.json"
 SAVE_LOCK = asyncio.Lock()
 
 async def load_state():
-    global LINKS, AUTH, SUBS
+    global LINKS, AUTH, SUBS, SUB_ADMINS
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if DATA_FILE.exists():
@@ -54,9 +54,10 @@ async def load_state():
             data = json.loads(raw)
             LINKS.update(data.get("links", {}))
             SUBS.update(data.get("subs", {}))
+            SUB_ADMINS.update(data.get("sub_admins", {}))
             if "password_hash" in data:
                 AUTH["password_hash"] = data["password_hash"]
-            logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs")
+            logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs, {len(SUB_ADMINS)} sub-admins")
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
 
@@ -67,6 +68,7 @@ async def save_state():
             data = {
                 "links": dict(LINKS),
                 "subs": dict(SUBS),
+                "sub_admins": dict(SUB_ADMINS),
                 "password_hash": AUTH["password_hash"],
                 "saved_at": datetime.now().isoformat(),
             }
@@ -93,8 +95,9 @@ LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 SUBS: dict = {}
 SUBS_LOCK = asyncio.Lock()
+SUB_ADMINS: dict = {}
+SUB_ADMINS_LOCK = asyncio.Lock()
 
-# پروتکل‌های پشتیبانی‌شده برای هر کانفیگ
 PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one")
 DEFAULT_PROTOCOL = "vless-ws"
 
@@ -117,23 +120,27 @@ AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456"
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
-async def create_session() -> str:
+async def create_session(user_type="admin", username=None) -> str:
     token = secrets.token_urlsafe(32)
     async with SESSIONS_LOCK:
-        SESSIONS[token] = time.time() + SESSION_TTL
+        SESSIONS[token] = {
+            "exp": time.time() + SESSION_TTL,
+            "user_type": user_type,
+            "username": username
+        }
     return token
 
-async def is_valid_session(token: str | None) -> bool:
+async def is_valid_session(token: str | None) -> dict | None:
     if not token:
-        return False
+        return None
     async with SESSIONS_LOCK:
-        exp = SESSIONS.get(token)
-        if exp is None:
-            return False
-        if exp < time.time():
+        session = SESSIONS.get(token)
+        if session is None:
+            return None
+        if session.get("exp", 0) < time.time():
             SESSIONS.pop(token, None)
-            return False
-        return True
+            return None
+        return session
 
 async def destroy_session(token: str | None):
     if not token:
@@ -143,9 +150,25 @@ async def destroy_session(token: str | None):
 
 async def require_auth(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
-    if not await is_valid_session(token):
+    session = await is_valid_session(token)
+    if not session:
         raise HTTPException(status_code=401, detail="unauthorized")
-    return token
+    
+    user_type = session.get("user_type", "admin")
+    username = session.get("username")
+    
+    if user_type == "sub_admin" and username:
+        async with SUB_ADMINS_LOCK:
+            admin = SUB_ADMINS.get(username)
+            if not admin:
+                raise HTTPException(status_code=403, detail="حساب کاربری پیدا نشد")
+            if not admin.get("active", True):
+                raise HTTPException(status_code=403, detail="حساب کاربری غیرفعال است")
+            remaining = admin.get("quota_bytes", 0) - admin.get("used_bytes", 0)
+            if remaining <= 0:
+                raise HTTPException(status_code=403, detail="سهمیه شما به پایان رسیده است")
+    
+    return {"token": token, "session": session}
 
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
 @app.on_event("startup")
@@ -178,7 +201,6 @@ def now_ir() -> datetime:
     return datetime.now(IRAN_TZ)
 
 def generate_vless_link(uuid: str, host: str, remark: str = "ARG", protocol: str = DEFAULT_PROTOCOL) -> str:
-    """می‌سازد VLESS share-link متناسب با پروتکل انتخاب‌شده"""
     if protocol == "vless-ws":
         path = f"/ws/{uuid}"
         params = {
@@ -256,6 +278,26 @@ def client_ip(request: Request) -> str:
         return real_ip.strip()
     return request.client.host if request.client else "نامشخص"
 
+# ── Sub-Admin Functions ──────────────────────────────────────────────────────
+async def get_sub_admin(username: str) -> dict | None:
+    async with SUB_ADMINS_LOCK:
+        return SUB_ADMINS.get(username)
+
+async def use_sub_admin_quota(username: str, bytes_used: int) -> bool:
+    async with SUB_ADMINS_LOCK:
+        if username not in SUB_ADMINS:
+            return False
+        admin = SUB_ADMINS[username]
+        quota = admin.get("quota_bytes", 0)
+        used = admin.get("used_bytes", 0)
+        if not admin.get("active", True):
+            return False
+        if quota > 0 and (used + bytes_used) > quota:
+            return False
+        admin["used_bytes"] = used + bytes_used
+        asyncio.create_task(save_state())
+        return True
+
 # ── Default link ──────────────────────────────────────────────────────────────
 _default_link_created = False
 
@@ -279,6 +321,7 @@ async def ensure_default_link():
                     "is_default": True,
                     "sub_id": None,
                     "protocol": DEFAULT_PROTOCOL,
+                    "created_by": None,
                 }
                 asyncio.create_task(save_state())
         _default_link_created = True
@@ -292,7 +335,7 @@ async def root():
 async def health():
     return {"status": "ok", "connections": len(connections), "uptime": uptime()}
 
-# ── Subscription (single link) ────────────────────────────────────────────────
+# ── Subscription ──────────────────────────────────────────────────────────────
 @app.get("/sub/{uuid}")
 async def subscription_single(uuid: str):
     import base64
@@ -320,12 +363,9 @@ async def subscription_all(_=Depends(require_auth)):
     content = base64.b64encode("\n".join(lines).encode()).decode()
     return Response(content=content, media_type="text/plain")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SUB GROUP endpoints
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ── Sub Groups ─────────────────────────────────────────────────────────────────
 @app.post("/api/subs")
-async def create_sub(request: Request, _=Depends(require_auth)):
+async def create_sub(request: Request, auth=Depends(require_auth)):
     body = await request.json()
     name = (body.get("name") or "گروه جدید").strip()[:60]
     desc = (body.get("desc") or "").strip()[:200]
@@ -434,7 +474,7 @@ async def assign_link_to_sub(sub_id: str, request: Request, _=Depends(require_au
     asyncio.create_task(save_state())
     return {"ok": True}
 
-# ── Public sub-group subscription file ───────────────────────────────────────
+# ── Public sub-group subscription ────────────────────────────────────────────
 @app.get("/sub-group/{uuid_key}")
 async def sub_group_subscription(uuid_key: str, request: Request):
     import base64
@@ -490,10 +530,11 @@ async def api_logout(request: Request):
 
 @app.get("/api/me")
 async def api_me(request: Request):
-    return {"authenticated": await is_valid_session(request.cookies.get(SESSION_COOKIE))}
+    session = await is_valid_session(request.cookies.get(SESSION_COOKIE))
+    return {"authenticated": session is not None}
 
 @app.post("/api/change-password")
-async def api_change_password(request: Request, token=Depends(require_auth)):
+async def api_change_password(request: Request, auth=Depends(require_auth)):
     body = await request.json()
     if hash_password(str(body.get("current_password", ""))) != AUTH["password_hash"]:
         raise HTTPException(status_code=400, detail="رمز فعلی اشتباه است")
@@ -502,15 +543,147 @@ async def api_change_password(request: Request, token=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۴ کاراکتر باشد")
     AUTH["password_hash"] = hash_password(new)
     async with SESSIONS_LOCK:
-        SESSIONS.clear()
-        SESSIONS[token] = time.time() + SESSION_TTL
+        for token, session in list(SESSIONS.items()):
+            if session.get("user_type") == "admin":
+                SESSIONS.pop(token, None)
+    token = await create_session()
     await save_state()
     log_activity("auth", "رمز عبور پنل تغییر کرد", "ok")
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
+    return resp
+
+# ── Sub-Admin Login ──────────────────────────────────────────────────────────
+@app.get("/admin_gigi", response_class=HTMLResponse)
+async def sub_admin_login_page(request: Request):
+    from pages import SUB_ADMIN_LOGIN_HTML
+    return HTMLResponse(content=SUB_ADMIN_LOGIN_HTML)
+
+@app.post("/api/sub-admin/login")
+async def sub_admin_login(request: Request):
+    body = await request.json()
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", "")).strip()
+    ip = client_ip(request)
+    
+    async with SUB_ADMINS_LOCK:
+        admin = SUB_ADMINS.get(username)
+        if not admin:
+            log_activity("sub_admin_auth", f"تلاش ورود ناموفق (کاربر不存在) از {ip}", "err")
+            raise HTTPException(status_code=401, detail="نام کاربری یا رمز عبور اشتباه است")
+        if not admin.get("active", True):
+            raise HTTPException(status_code=403, detail="حساب کاربری غیرفعال است")
+        if hash_password(password) != admin.get("password_hash"):
+            log_activity("sub_admin_auth", f"تلاش ورود ناموفق (رمز اشتباه) از {ip}", "err")
+            raise HTTPException(status_code=401, detail="نام کاربری یا رمز عبور اشتباه است")
+        remaining = admin.get("quota_bytes", 0) - admin.get("used_bytes", 0)
+        if remaining <= 0:
+            log_activity("sub_admin_auth", f"تلاش ورود با سهمیه تمام شده از {ip}", "warn")
+            raise HTTPException(status_code=403, detail="سهمیه شما به پایان رسیده است")
+    
+    token = await create_session(user_type="sub_admin", username=username)
+    log_activity("sub_admin_auth", f"ورود موفق ادمین فرعی «{username}» از {ip}", "ok")
+    resp = JSONResponse({"ok": True, "user_type": "sub_admin", "username": username})
+    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
+    return resp
+
+@app.get("/api/sub-admin/status")
+async def sub_admin_status(auth=Depends(require_auth)):
+    session = auth["session"]
+    if session.get("user_type") != "sub_admin":
+        raise HTTPException(status_code=403, detail="دسترسی فقط برای ادمین‌های فرعی")
+    username = session.get("username")
+    
+    async with SUB_ADMINS_LOCK:
+        admin = SUB_ADMINS.get(username)
+        if not admin:
+            raise HTTPException(status_code=404, detail="ادمین پیدا نشد")
+        quota = admin.get("quota_bytes", 0)
+        used = admin.get("used_bytes", 0)
+        remaining = quota - used
+        return {
+            "username": username,
+            "quota_bytes": quota,
+            "quota_fmt": fmt_bytes(quota),
+            "used_bytes": used,
+            "used_fmt": fmt_bytes(used),
+            "remaining_bytes": remaining if remaining > 0 else 0,
+            "remaining_fmt": fmt_bytes(remaining) if remaining > 0 else "۰",
+            "used_percent": round((used / quota) * 100) if quota > 0 else 0,
+            "is_exhausted": remaining <= 0,
+            "active": admin.get("active", True),
+        }
+
+# ── Sub-Admin Management ─────────────────────────────────────────────────────
+@app.post("/api/sub-admins")
+async def create_sub_admin(request: Request, auth=Depends(require_auth)):
+    if auth["session"].get("user_type") == "sub_admin":
+        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
+    
+    body = await request.json()
+    username = str(body.get("username", "")).strip()
+    password = str(body.get("password", "")).strip()
+    quota_gb = float(body.get("quota_gb", 2))
+    
+    if not username or len(username) < 3:
+        raise HTTPException(status_code=400, detail="نام کاربری حداقل ۳ کاراکتر")
+    if not password or len(password) < 4:
+        raise HTTPException(status_code=400, detail="رمز عبور حداقل ۴ کاراکتر")
+    if quota_gb < 0.1:
+        raise HTTPException(status_code=400, detail="سهمیه باید حداقل ۰.۱ گیگ باشد")
+    
+    async with SUB_ADMINS_LOCK:
+        if username in SUB_ADMINS:
+            raise HTTPException(status_code=400, detail="این نام کاربری قبلاً ثبت شده")
+        SUB_ADMINS[username] = {
+            "password_hash": hash_password(password),
+            "quota_bytes": int(quota_gb * 1024 ** 3),
+            "used_bytes": 0,
+            "created_at": datetime.now().isoformat(),
+            "active": True,
+        }
+    
+    asyncio.create_task(save_state())
+    log_activity("sub_admin", f"ادمین فرعی «{username}» با سهمیه {quota_gb}GB ساخته شد", "ok")
+    return {"ok": True, "username": username, "quota_gb": quota_gb}
+
+@app.get("/api/sub-admins")
+async def list_sub_admins(auth=Depends(require_auth)):
+    if auth["session"].get("user_type") == "sub_admin":
+        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
+    
+    async with SUB_ADMINS_LOCK:
+        result = []
+        for username, data in SUB_ADMINS.items():
+            quota = data.get("quota_bytes", 0)
+            used = data.get("used_bytes", 0)
+            result.append({
+                "username": username,
+                "quota_gb": round(quota / 1024**3, 2),
+                "used_gb": round(used / 1024**3, 2),
+                "remaining_gb": round((quota - used) / 1024**3, 2),
+                "used_percent": round((used / quota) * 100) if quota > 0 else 0,
+                "created_at": data.get("created_at"),
+                "active": data.get("active", True),
+            })
+        return {"sub_admins": result}
+
+@app.delete("/api/sub-admins/{username}")
+async def delete_sub_admin(username: str, auth=Depends(require_auth)):
+    if auth["session"].get("user_type") == "sub_admin":
+        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
+    
+    async with SUB_ADMINS_LOCK:
+        if username not in SUB_ADMINS:
+            raise HTTPException(status_code=404, detail="ادمین پیدا نشد")
+        del SUB_ADMINS[username]
+    asyncio.create_task(save_state())
+    log_activity("sub_admin", f"ادمین فرعی «{username}» حذف شد", "warn")
     return {"ok": True}
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 @app.get("/stats")
-async def get_stats(_=Depends(require_auth)):
+async def get_stats(auth=Depends(require_auth)):
     async with LINKS_LOCK:
         snap = dict(LINKS)
     return {
@@ -530,12 +703,19 @@ async def get_stats(_=Depends(require_auth)):
 
 # ── Activity Logs ─────────────────────────────────────────────────────────────
 @app.get("/api/activity")
-async def get_activity(_=Depends(require_auth)):
+async def get_activity(auth=Depends(require_auth)):
+    if auth["session"].get("user_type") == "sub_admin":
+        username = auth["session"].get("username")
+        filtered = [log for log in activity_logs if "sub_admin" in log.get("kind", "") and username in log.get("message", "")]
+        return {"logs": filtered[-50:]}
     return {"logs": list(activity_logs)[-150:]}
 
-# ── Live connections (with IP) ────────────────────────────────────────────────
+# ── Live connections ──────────────────────────────────────────────────────────
 @app.get("/api/connections")
-async def get_connections(_=Depends(require_auth)):
+async def get_connections(auth=Depends(require_auth)):
+    if auth["session"].get("user_type") == "sub_admin":
+        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
+    
     async with LINKS_LOCK:
         snap = dict(LINKS)
 
@@ -590,7 +770,7 @@ async def get_connections(_=Depends(require_auth)):
 
 # ── Link Management ───────────────────────────────────────────────────────────
 @app.post("/api/links")
-async def create_link(request: Request, _=Depends(require_auth)):
+async def create_link(request: Request, auth=Depends(require_auth)):
     body = await request.json()
     label = (body.get("label") or "لینک جدید").strip()[:60]
     lv = float(body.get("limit_value") or 0)
@@ -603,6 +783,18 @@ async def create_link(request: Request, _=Depends(require_auth)):
     protocol = body.get("protocol") or DEFAULT_PROTOCOL
     if protocol not in PROTOCOLS:
         protocol = DEFAULT_PROTOCOL
+
+    created_by = None
+    session = auth["session"]
+    if session.get("user_type") == "sub_admin":
+        username = session.get("username")
+        created_by = username
+        async with SUB_ADMINS_LOCK:
+            admin = SUB_ADMINS.get(username)
+            if admin:
+                remaining = admin.get("quota_bytes", 0) - admin.get("used_bytes", 0)
+                if remaining <= 0:
+                    raise HTTPException(status_code=403, detail="سهمیه شما به پایان رسیده است")
 
     uid = generate_uuid()
     async with LINKS_LOCK:
@@ -617,6 +809,7 @@ async def create_link(request: Request, _=Depends(require_auth)):
             "is_default": False,
             "sub_id": sub_id,
             "protocol": protocol,
+            "created_by": created_by,
         }
 
     if sub_id:
@@ -638,10 +831,15 @@ async def create_link(request: Request, _=Depends(require_auth)):
     }
 
 @app.get("/api/links")
-async def list_links(_=Depends(require_auth)):
+async def list_links(auth=Depends(require_auth)):
     host = get_host()
     async with LINKS_LOCK:
         snap = dict(LINKS)
+    
+    if auth["session"].get("user_type") == "sub_admin":
+        username = auth["session"].get("username")
+        snap = {uid: d for uid, d in snap.items() if d.get("created_by") == username}
+    
     result = []
     for uid, d in snap.items():
         proto = d.get("protocol", DEFAULT_PROTOCOL)
@@ -657,12 +855,17 @@ async def list_links(_=Depends(require_auth)):
     return {"links": result}
 
 @app.patch("/api/links/{uid}")
-async def update_link(uid: str, request: Request, _=Depends(require_auth)):
+async def update_link(uid: str, request: Request, auth=Depends(require_auth)):
     body = await request.json()
     async with LINKS_LOCK:
         if uid not in LINKS:
             raise HTTPException(status_code=404, detail="link not found")
         link = LINKS[uid]
+        
+        if auth["session"].get("user_type") == "sub_admin":
+            if link.get("created_by") != auth["session"].get("username"):
+                raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
+        
         old_sub = link.get("sub_id")
         label = link.get("label")
         if "active" in body:
@@ -703,10 +906,15 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
-async def delete_link(uid: str, _=Depends(require_auth)):
+async def delete_link(uid: str, auth=Depends(require_auth)):
     async with LINKS_LOCK:
         if uid not in LINKS:
             raise HTTPException(status_code=404, detail="link not found")
+        
+        if auth["session"].get("user_type") == "sub_admin":
+            if LINKS[uid].get("created_by") != auth["session"].get("username"):
+                raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
+        
         label = LINKS[uid].get("label", uid)
         sub_id = LINKS[uid].get("sub_id")
         del LINKS[uid]
@@ -736,7 +944,7 @@ from relay_vless import (
 app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# XHTTP — Siz10a XHTTP Ultra
+# XHTTP
 # ══════════════════════════════════════════════════════════════════════════════
 from xhttp_siz10 import router as xhttp_router
 app.include_router(xhttp_router)
@@ -828,7 +1036,7 @@ async def public_sub_data(uuid_key: str, request: Request):
         "links": links_out,
     }
 
-# ── HTML Pages (login + dashboard) ───────────────────────────────────────────
+# ── HTML Pages ────────────────────────────────────────────────────────────────
 from pages import LOGIN_HTML, DASHBOARD_HTML
 
 @app.get("/login", response_class=HTMLResponse)
@@ -839,7 +1047,8 @@ async def login_page(request: Request):
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
+    session = await is_valid_session(request.cookies.get(SESSION_COOKIE))
+    if not session:
         return RedirectResponse(url="/login")
     await ensure_default_link()
     return HTMLResponse(content=DASHBOARD_HTML)
