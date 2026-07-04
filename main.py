@@ -23,7 +23,7 @@ logger = logging.getLogger("ARG-Gateway")
 
 IRAN_TZ = ZoneInfo("Asia/Tehran")
 
-app = FastAPI(title="ARG Gateway - ARG", docs_url=None, redoc_url=None)
+app = FastAPI(title="ARG Gateway", docs_url=None, redoc_url=None)
 
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
@@ -99,7 +99,6 @@ PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one
 DEFAULT_PROTOCOL = "vless-ws"
 
 def log_activity(kind: str, message: str, level: str = "info"):
-    """ثبت یک رخداد در لاگ فعالیت‌ها (ساخت/حذف/ویرایش کانفیگ، ورود، و...)."""
     activity_logs.append({
         "kind": kind,
         "level": level,
@@ -179,7 +178,7 @@ def now_ir() -> datetime:
     return datetime.now(IRAN_TZ)
 
 def generate_vless_link(uuid: str, host: str, remark: str = "ARG", protocol: str = DEFAULT_PROTOCOL) -> str:
-    """می‌سازد VLESS share-link متناسب با پروتکل انتخاب‌شده (WS کلاسیک یا یکی از مدهای XHTTP)."""
+    """می‌سازد VLESS share-link متناسب با پروتکل انتخاب‌شده"""
     if protocol == "vless-ws":
         path = f"/ws/{uuid}"
         params = {
@@ -193,8 +192,7 @@ def generate_vless_link(uuid: str, host: str, remark: str = "ARG", protocol: str
             "alpn": "http/1.1",
         }
     else:
-        # xhttp-packet-up / xhttp-stream-up / xhttp-stream-one
-        mode = protocol.replace("xhttp-", "")  # packet-up | stream-up | stream-one
+        mode = protocol.replace("xhttp-", "")
         path = f"/xhttp-siz10/{mode}/{uuid}"
         params = {
             "encryption": "none",
@@ -208,7 +206,7 @@ def generate_vless_link(uuid: str, host: str, remark: str = "ARG", protocol: str
             "alpn": "h2,http/1.1",
         }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"arg://{uuid}@{host}:443?{query}#{quote(remark)}"
+    return f"vless://{uuid}@{host}:443?{query}#{quote(remark)}"
 
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
@@ -250,7 +248,6 @@ def fmt_bytes(b: int) -> str:
     return f"{b/1024**3:.2f} GB"
 
 def client_ip(request: Request) -> str:
-    """آی‌پی واقعی کلاینت رو با احتساب هدرهای پراکسی (Railway/Cloudflare) برمی‌گردونه."""
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
         return fwd.split(",")[0].strip()
@@ -724,7 +721,7 @@ async def delete_link(uid: str, _=Depends(require_auth)):
     return {"ok": True, "deleted": uid}
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VLESS Relay — جدا شده به relay_vless.py
+# VLESS Relay
 # ══════════════════════════════════════════════════════════════════════════════
 
 from relay_vless import (
