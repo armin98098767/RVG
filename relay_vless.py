@@ -19,8 +19,8 @@ from main import (
     save_state,
     log_activity,
     now_ir,
-    SUB_ADMINS,
-    SUB_ADMINS_LOCK,
+    check_device_limit,
+    remove_device_connection,
 )
 
 RELAY_BUF = 256 * 1024
@@ -62,18 +62,6 @@ async def check_and_use(uid: str, n: int) -> bool:
             return False
         if not is_link_allowed(link):
             return False
-        
-        created_by = link.get("created_by")
-        if created_by:
-            async with SUB_ADMINS_LOCK:
-                if created_by in SUB_ADMINS:
-                    admin = SUB_ADMINS[created_by]
-                    remaining = admin.get("quota_bytes", 0) - admin.get("used_bytes", 0)
-                    if remaining <= 0:
-                        return False
-                    admin["used_bytes"] = admin.get("used_bytes", 0) + n
-                    asyncio.create_task(save_state())
-        
         link["used_bytes"] += n
         stats["total_bytes"] += n
         hourly_traffic[now_ir().strftime("%H:00")] += n
@@ -123,16 +111,23 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
 
 async def websocket_tunnel(ws: WebSocket, uuid: str):
     await ws.accept()
-
+    
+    ip = _ws_client_ip(ws)
+    
+    # ========== چک محدودیت دستگاه ==========
+    if not await check_device_limit(uuid, ip):
+        await ws.close(code=1008, reason="Device limit exceeded")
+        return
+    
     async with LINKS_LOCK:
         link = LINKS.get(uuid)
 
     if not is_link_allowed(link):
         logger.warning(f"🚫 WS rejected uuid={uuid[:8]}… (not allowed)")
         await ws.close(code=1008, reason="not authorized")
+        await remove_device_connection(uuid, ip)
         return
 
-    ip = _ws_client_ip(ws)
     conn_id = secrets.token_urlsafe(6)
     connections[conn_id] = {
         "uuid": uuid,
@@ -209,4 +204,5 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
             except Exception:
                 pass
         connections.pop(conn_id, None)
+        await remove_device_connection(uuid, ip)
         logger.info(f"🔌 WS closed [{conn_id}] total={len(connections)}")
