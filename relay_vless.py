@@ -1,6 +1,5 @@
 # relay_vless.py
-# بخش VLESS Relay — جدا شده از main.py (منطق اصلی دست‌نخورده)
-# تغییر: ثبت IP واقعی کلاینت (با احتساب هدر x-forwarded-for پشت پراکسی) در connections
+# بخش ARG Relay — جدا شده از main.py
 
 import asyncio
 import secrets
@@ -23,7 +22,7 @@ from main import (
 )
 
 # ══════════════════════════════════════════════════════════════════════════════
-# VLESS Relay — بهینه‌شده برای حداکثر throughput
+# ARG Relay — بهینه‌شده برای حداکثر throughput
 # ══════════════════════════════════════════════════════════════════════════════
 
 RELAY_BUF = 256 * 1024   # 256 KB buffer
