@@ -153,21 +153,6 @@ async def require_auth(request: Request):
     session = await is_valid_session(token)
     if not session:
         raise HTTPException(status_code=401, detail="unauthorized")
-    
-    user_type = session.get("user_type", "admin")
-    username = session.get("username")
-    
-    if user_type == "sub_admin" and username:
-        async with SUB_ADMINS_LOCK:
-            admin = SUB_ADMINS.get(username)
-            if not admin:
-                raise HTTPException(status_code=403, detail="حساب کاربری پیدا نشد")
-            if not admin.get("active", True):
-                raise HTTPException(status_code=403, detail="حساب کاربری غیرفعال است")
-            remaining = admin.get("quota_bytes", 0) - admin.get("used_bytes", 0)
-            if remaining <= 0:
-                raise HTTPException(status_code=403, detail="سهمیه شما به پایان رسیده است")
-    
     return {"token": token, "session": session}
 
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
@@ -351,7 +336,7 @@ async def subscription_single(uuid: str):
                     headers={"profile-title": quote(link["label"])})
 
 @app.get("/sub-all")
-async def subscription_all(_=Depends(require_auth)):
+async def subscription_all(auth=Depends(require_auth)):
     import base64
     host = get_host()
     async with LINKS_LOCK:
@@ -366,7 +351,7 @@ async def subscription_all(_=Depends(require_auth)):
 # ── Sub Groups ─────────────────────────────────────────────────────────────────
 @app.post("/api/subs")
 async def create_sub(request: Request, auth=Depends(require_auth)):
-    # ✅ فقط ادمین اصلی
+    # ❌ ادمین فرعی دسترسی نداره
     if auth["session"].get("user_type") == "sub_admin":
         raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
     
@@ -397,10 +382,7 @@ async def create_sub(request: Request, auth=Depends(require_auth)):
 
 @app.get("/api/subs")
 async def list_subs(auth=Depends(require_auth)):
-    # ✅ فقط ادمین اصلی
-    if auth["session"].get("user_type") == "sub_admin":
-        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
-    
+    # ✅ هم ادمین اصلی هم فرعی میتونن ببینن
     host = get_host()
     async with SUBS_LOCK:
         snap_subs = dict(SUBS)
@@ -428,7 +410,7 @@ async def list_subs(auth=Depends(require_auth)):
 
 @app.patch("/api/subs/{sub_id}")
 async def update_sub(sub_id: str, request: Request, auth=Depends(require_auth)):
-    # ✅ فقط ادمین اصلی
+    # ❌ ادمین فرعی دسترسی نداره
     if auth["session"].get("user_type") == "sub_admin":
         raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
     
@@ -451,7 +433,7 @@ async def update_sub(sub_id: str, request: Request, auth=Depends(require_auth)):
 
 @app.delete("/api/subs/{sub_id}")
 async def delete_sub(sub_id: str, auth=Depends(require_auth)):
-    # ✅ فقط ادمین اصلی
+    # ❌ ادمین فرعی دسترسی نداره
     if auth["session"].get("user_type") == "sub_admin":
         raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
     
@@ -470,7 +452,7 @@ async def delete_sub(sub_id: str, auth=Depends(require_auth)):
 
 @app.post("/api/subs/{sub_id}/links")
 async def assign_link_to_sub(sub_id: str, request: Request, auth=Depends(require_auth)):
-    # ✅ فقط ادمین اصلی
+    # ❌ ادمین فرعی دسترسی نداره
     if auth["session"].get("user_type") == "sub_admin":
         raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
     
@@ -555,11 +537,28 @@ async def api_me(request: Request):
 
 @app.post("/api/change-password")
 async def api_change_password(request: Request, auth=Depends(require_auth)):
-    # ✅ فقط ادمین اصلی
-    if auth["session"].get("user_type") == "sub_admin":
-        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
-    
+    # ✅ هم ادمین اصلی هم فرعی (فقط رمز خودش)
     body = await request.json()
+    session = auth["session"]
+    
+    # اگه ادمین فرعی باشه، رمزش رو از دیتابیس میخونیم
+    if session.get("user_type") == "sub_admin":
+        username = session.get("username")
+        async with SUB_ADMINS_LOCK:
+            admin = SUB_ADMINS.get(username)
+            if not admin:
+                raise HTTPException(status_code=404, detail="ادمین پیدا نشد")
+            if hash_password(str(body.get("current_password", ""))) != admin.get("password_hash"):
+                raise HTTPException(status_code=400, detail="رمز فعلی اشتباه است")
+            new = str(body.get("new_password", ""))
+            if len(new) < 4:
+                raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۴ کاراکتر باشد")
+            admin["password_hash"] = hash_password(new)
+            await save_state()
+            log_activity("sub_admin", f"ادمین فرعی «{username}» رمز خود را تغییر داد", "ok")
+            return {"ok": True}
+    
+    # ادمین اصلی
     if hash_password(str(body.get("current_password", ""))) != AUTH["password_hash"]:
         raise HTTPException(status_code=400, detail="رمز فعلی اشتباه است")
     new = str(body.get("new_password", ""))
@@ -567,8 +566,8 @@ async def api_change_password(request: Request, auth=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۴ کاراکتر باشد")
     AUTH["password_hash"] = hash_password(new)
     async with SESSIONS_LOCK:
-        for token, session in list(SESSIONS.items()):
-            if session.get("user_type") == "admin":
+        for token, session_data in list(SESSIONS.items()):
+            if session_data.get("user_type") == "admin":
                 SESSIONS.pop(token, None)
     token = await create_session()
     await save_state()
@@ -642,7 +641,7 @@ async def sub_admin_status(auth=Depends(require_auth)):
 # ── Sub-Admin Management (فقط ادمین اصلی) ──────────────────────────────────
 @app.post("/api/sub-admins")
 async def create_sub_admin(request: Request, auth=Depends(require_auth)):
-    # ✅ فقط ادمین اصلی
+    # ❌ فقط ادمین اصلی
     if auth["session"].get("user_type") == "sub_admin":
         raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
     
@@ -675,7 +674,7 @@ async def create_sub_admin(request: Request, auth=Depends(require_auth)):
 
 @app.get("/api/sub-admins")
 async def list_sub_admins(auth=Depends(require_auth)):
-    # ✅ فقط ادمین اصلی
+    # ❌ فقط ادمین اصلی - ادمین فرعی نبینه
     if auth["session"].get("user_type") == "sub_admin":
         raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
     
@@ -697,7 +696,7 @@ async def list_sub_admins(auth=Depends(require_auth)):
 
 @app.delete("/api/sub-admins/{username}")
 async def delete_sub_admin(username: str, auth=Depends(require_auth)):
-    # ✅ فقط ادمین اصلی
+    # ❌ فقط ادمین اصلی
     if auth["session"].get("user_type") == "sub_admin":
         raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
     
@@ -712,10 +711,7 @@ async def delete_sub_admin(username: str, auth=Depends(require_auth)):
 # ── Stats ─────────────────────────────────────────────────────────────────────
 @app.get("/stats")
 async def get_stats(auth=Depends(require_auth)):
-    # ✅ فقط ادمین اصلی
-    if auth["session"].get("user_type") == "sub_admin":
-        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
-    
+    # ✅ هم ادمین اصلی هم فرعی میتونن ببینن
     async with LINKS_LOCK:
         snap = dict(LINKS)
     return {
@@ -736,18 +732,13 @@ async def get_stats(auth=Depends(require_auth)):
 # ── Activity Logs ─────────────────────────────────────────────────────────────
 @app.get("/api/activity")
 async def get_activity(auth=Depends(require_auth)):
-    # ✅ فقط ادمین اصلی - ادمین فرعی دسترسی نداره
-    if auth["session"].get("user_type") == "sub_admin":
-        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
+    # ✅ هم ادمین اصلی هم فرعی میتونن ببینن
     return {"logs": list(activity_logs)[-150:]}
 
 # ── Live connections ──────────────────────────────────────────────────────────
 @app.get("/api/connections")
 async def get_connections(auth=Depends(require_auth)):
-    # ✅ فقط ادمین اصلی
-    if auth["session"].get("user_type") == "sub_admin":
-        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
-    
+    # ✅ هم ادمین اصلی هم فرعی میتونن ببینن
     async with LINKS_LOCK:
         snap = dict(LINKS)
 
@@ -803,7 +794,7 @@ async def get_connections(auth=Depends(require_auth)):
 # ── Link Management ───────────────────────────────────────────────────────────
 @app.post("/api/links")
 async def create_link(request: Request, auth=Depends(require_auth)):
-    # ✅ هم ادمین اصلی و هم ادمین فرعی
+    # ✅ هم ادمین اصلی هم فرعی (ادمین فرعی با سهمیه)
     body = await request.json()
     label = (body.get("label") or "لینک جدید").strip()[:60]
     lv = float(body.get("limit_value") or 0)
@@ -865,14 +856,10 @@ async def create_link(request: Request, auth=Depends(require_auth)):
 
 @app.get("/api/links")
 async def list_links(auth=Depends(require_auth)):
-    # ✅ ادمین اصلی همه رو میبینه، ادمین فرعی فقط کانفیگ‌های خودش
+    # ✅ هم ادمین اصلی هم فرعی میتونن همه کانفیگ‌ها رو ببینن
     host = get_host()
     async with LINKS_LOCK:
         snap = dict(LINKS)
-    
-    if auth["session"].get("user_type") == "sub_admin":
-        username = auth["session"].get("username")
-        snap = {uid: d for uid, d in snap.items() if d.get("created_by") == username}
     
     result = []
     for uid, d in snap.items():
