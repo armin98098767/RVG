@@ -1,5 +1,5 @@
 # relay_vless.py
-# بخش ARG Relay — جدا شده از main.py
+# بخش ARG Relay
 
 import asyncio
 import secrets
@@ -19,13 +19,11 @@ from main import (
     save_state,
     log_activity,
     now_ir,
+    SUB_ADMINS,
+    SUB_ADMINS_LOCK,
 )
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ARG Relay — بهینه‌شده برای حداکثر throughput
-# ══════════════════════════════════════════════════════════════════════════════
-
-RELAY_BUF = 256 * 1024   # 256 KB buffer
+RELAY_BUF = 256 * 1024
 
 def _ws_client_ip(ws: WebSocket) -> str:
     fwd = ws.headers.get("x-forwarded-for")
@@ -64,6 +62,18 @@ async def check_and_use(uid: str, n: int) -> bool:
             return False
         if not is_link_allowed(link):
             return False
+        
+        created_by = link.get("created_by")
+        if created_by:
+            async with SUB_ADMINS_LOCK:
+                if created_by in SUB_ADMINS:
+                    admin = SUB_ADMINS[created_by]
+                    remaining = admin.get("quota_bytes", 0) - admin.get("used_bytes", 0)
+                    if remaining <= 0:
+                        return False
+                    admin["used_bytes"] = admin.get("used_bytes", 0) + n
+                    asyncio.create_task(save_state())
+        
         link["used_bytes"] += n
         stats["total_bytes"] += n
         hourly_traffic[now_ir().strftime("%H:00")] += n
