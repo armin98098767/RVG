@@ -45,7 +45,7 @@ DATA_FILE = DATA_DIR / "arg_state.json"
 SAVE_LOCK = asyncio.Lock()
 
 async def load_state():
-    global LINKS, AUTH, SUBS, SUB_ADMINS
+    global LINKS, AUTH, SUBS
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if DATA_FILE.exists():
@@ -54,10 +54,9 @@ async def load_state():
             data = json.loads(raw)
             LINKS.update(data.get("links", {}))
             SUBS.update(data.get("subs", {}))
-            SUB_ADMINS.update(data.get("sub_admins", {}))
             if "password_hash" in data:
                 AUTH["password_hash"] = data["password_hash"]
-            logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs, {len(SUB_ADMINS)} sub-admins")
+            logger.info(f"State loaded: {len(LINKS)} links, {len(SUBS)} subs")
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
 
@@ -68,7 +67,6 @@ async def save_state():
             data = {
                 "links": dict(LINKS),
                 "subs": dict(SUBS),
-                "sub_admins": dict(SUB_ADMINS),
                 "password_hash": AUTH["password_hash"],
                 "saved_at": datetime.now().isoformat(),
             }
@@ -95,8 +93,6 @@ LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 SUBS: dict = {}
 SUBS_LOCK = asyncio.Lock()
-SUB_ADMINS: dict = {}
-SUB_ADMINS_LOCK = asyncio.Lock()
 
 PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one")
 DEFAULT_PROTOCOL = "vless-ws"
@@ -120,27 +116,23 @@ AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456"
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
-async def create_session(user_type="admin", username=None) -> str:
+async def create_session() -> str:
     token = secrets.token_urlsafe(32)
     async with SESSIONS_LOCK:
-        SESSIONS[token] = {
-            "exp": time.time() + SESSION_TTL,
-            "user_type": user_type,
-            "username": username
-        }
+        SESSIONS[token] = time.time() + SESSION_TTL
     return token
 
-async def is_valid_session(token: str | None) -> dict | None:
+async def is_valid_session(token: str | None) -> bool:
     if not token:
-        return None
+        return False
     async with SESSIONS_LOCK:
-        session = SESSIONS.get(token)
-        if session is None:
-            return None
-        if session.get("exp", 0) < time.time():
+        exp = SESSIONS.get(token)
+        if exp is None:
+            return False
+        if exp < time.time():
             SESSIONS.pop(token, None)
-            return None
-        return session
+            return False
+        return True
 
 async def destroy_session(token: str | None):
     if not token:
@@ -150,10 +142,9 @@ async def destroy_session(token: str | None):
 
 async def require_auth(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
-    session = await is_valid_session(token)
-    if not session:
+    if not await is_valid_session(token):
         raise HTTPException(status_code=401, detail="unauthorized")
-    return {"token": token, "session": session}
+    return token
 
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
 @app.on_event("startup")
@@ -185,7 +176,7 @@ def generate_uuid() -> str:
 def now_ir() -> datetime:
     return datetime.now(IRAN_TZ)
 
-def generate_vless_link(uuid: str, host: str, remark: str = "ARG", protocol: str = DEFAULT_PROTOCOL) -> str:
+def generate_vless_link(uuid: str, host: str, remark: str = "ARG", protocol: str = DEFAULT_PROTOCOL, fingerprint: str = "chrome") -> str:
     if protocol == "vless-ws":
         path = f"/ws/{uuid}"
         params = {
@@ -195,7 +186,7 @@ def generate_vless_link(uuid: str, host: str, remark: str = "ARG", protocol: str
             "host": host,
             "path": path,
             "sni": host,
-            "fp": "chrome",
+            "fp": fingerprint,
             "alpn": "http/1.1",
         }
     else:
@@ -209,7 +200,7 @@ def generate_vless_link(uuid: str, host: str, remark: str = "ARG", protocol: str
             "host": host,
             "path": path,
             "sni": host,
-            "fp": "chrome",
+            "fp": fingerprint,
             "alpn": "h2,http/1.1",
         }
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
@@ -263,25 +254,39 @@ def client_ip(request: Request) -> str:
         return real_ip.strip()
     return request.client.host if request.client else "نامشخص"
 
-# ── Sub-Admin Functions ──────────────────────────────────────────────────────
-async def get_sub_admin(username: str) -> dict | None:
-    async with SUB_ADMINS_LOCK:
-        return SUB_ADMINS.get(username)
+# ── Device Limit Functions ──────────────────────────────────────────────────
+device_connections: dict = {}  # {uuid: [ip1, ip2, ...]}
+DEVICE_CONNECTIONS_LOCK = asyncio.Lock()
 
-async def use_sub_admin_quota(username: str, bytes_used: int) -> bool:
-    async with SUB_ADMINS_LOCK:
-        if username not in SUB_ADMINS:
+async def check_device_limit(uuid: str, client_ip: str) -> bool:
+    """بررسی محدودیت دستگاه همزمان"""
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+        if not link:
             return False
-        admin = SUB_ADMINS[username]
-        quota = admin.get("quota_bytes", 0)
-        used = admin.get("used_bytes", 0)
-        if not admin.get("active", True):
+        max_devices = link.get("max_devices", 0)
+        if max_devices == 0:
+            return True
+    
+    async with DEVICE_CONNECTIONS_LOCK:
+        current_ips = device_connections.get(uuid, [])
+        if client_ip in current_ips:
+            return True
+        if len(current_ips) >= max_devices:
             return False
-        if quota > 0 and (used + bytes_used) > quota:
-            return False
-        admin["used_bytes"] = used + bytes_used
-        asyncio.create_task(save_state())
+        if uuid not in device_connections:
+            device_connections[uuid] = []
+        device_connections[uuid].append(client_ip)
         return True
+
+async def remove_device_connection(uuid: str, client_ip: str):
+    """حذف اتصال از لیست فعال"""
+    async with DEVICE_CONNECTIONS_LOCK:
+        if uuid in device_connections:
+            if client_ip in device_connections[uuid]:
+                device_connections[uuid].remove(client_ip)
+                if not device_connections[uuid]:
+                    del device_connections[uuid]
 
 # ── Default link ──────────────────────────────────────────────────────────────
 _default_link_created = False
@@ -306,7 +311,8 @@ async def ensure_default_link():
                     "is_default": True,
                     "sub_id": None,
                     "protocol": DEFAULT_PROTOCOL,
-                    "created_by": None,
+                    "max_devices": 0,
+                    "fingerprint": "chrome",
                 }
                 asyncio.create_task(save_state())
         _default_link_created = True
@@ -330,31 +336,28 @@ async def subscription_single(uuid: str):
         raise HTTPException(status_code=404, detail="not found or inactive")
     host = get_host()
     proto = link.get("protocol", DEFAULT_PROTOCOL)
-    vless = generate_vless_link(uuid, host, remark=f"ARG-{link['label']}", protocol=proto)
+    fp = link.get("fingerprint", "chrome")
+    vless = generate_vless_link(uuid, host, remark=f"ARG-{link['label']}", protocol=proto, fingerprint=fp)
     content = base64.b64encode(vless.encode()).decode()
     return Response(content=content, media_type="text/plain",
                     headers={"profile-title": quote(link["label"])})
 
 @app.get("/sub-all")
-async def subscription_all(auth=Depends(require_auth)):
+async def subscription_all(_=Depends(require_auth)):
     import base64
     host = get_host()
     async with LINKS_LOCK:
-        lines = [
-            generate_vless_link(uid, host, remark=f"ARG-{d['label']}", protocol=d.get("protocol", DEFAULT_PROTOCOL))
-            for uid, d in LINKS.items()
-            if is_link_allowed(d)
-        ]
+        lines = []
+        for uid, d in LINKS.items():
+            if is_link_allowed(d):
+                fp = d.get("fingerprint", "chrome")
+                lines.append(generate_vless_link(uid, host, remark=f"ARG-{d['label']}", protocol=d.get("protocol", DEFAULT_PROTOCOL), fingerprint=fp))
     content = base64.b64encode("\n".join(lines).encode()).decode()
     return Response(content=content, media_type="text/plain")
 
 # ── Sub Groups ─────────────────────────────────────────────────────────────────
 @app.post("/api/subs")
-async def create_sub(request: Request, auth=Depends(require_auth)):
-    # ❌ ادمین فرعی دسترسی نداره
-    if auth["session"].get("user_type") == "sub_admin":
-        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
-    
+async def create_sub(request: Request, _=Depends(require_auth)):
     body = await request.json()
     name = (body.get("name") or "گروه جدید").strip()[:60]
     desc = (body.get("desc") or "").strip()[:200]
@@ -381,8 +384,7 @@ async def create_sub(request: Request, auth=Depends(require_auth)):
     }
 
 @app.get("/api/subs")
-async def list_subs(auth=Depends(require_auth)):
-    # ✅ هم ادمین اصلی هم فرعی میتونن ببینن
+async def list_subs(_=Depends(require_auth)):
     host = get_host()
     async with SUBS_LOCK:
         snap_subs = dict(SUBS)
@@ -409,11 +411,7 @@ async def list_subs(auth=Depends(require_auth)):
     return {"subs": result}
 
 @app.patch("/api/subs/{sub_id}")
-async def update_sub(sub_id: str, request: Request, auth=Depends(require_auth)):
-    # ❌ ادمین فرعی دسترسی نداره
-    if auth["session"].get("user_type") == "sub_admin":
-        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
-    
+async def update_sub(sub_id: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
     async with SUBS_LOCK:
         if sub_id not in SUBS:
@@ -432,11 +430,7 @@ async def update_sub(sub_id: str, request: Request, auth=Depends(require_auth)):
     return {"ok": True}
 
 @app.delete("/api/subs/{sub_id}")
-async def delete_sub(sub_id: str, auth=Depends(require_auth)):
-    # ❌ ادمین فرعی دسترسی نداره
-    if auth["session"].get("user_type") == "sub_admin":
-        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
-    
+async def delete_sub(sub_id: str, _=Depends(require_auth)):
     async with SUBS_LOCK:
         if sub_id not in SUBS:
             raise HTTPException(status_code=404, detail="sub not found")
@@ -451,11 +445,7 @@ async def delete_sub(sub_id: str, auth=Depends(require_auth)):
     return {"ok": True, "deleted": sub_id}
 
 @app.post("/api/subs/{sub_id}/links")
-async def assign_link_to_sub(sub_id: str, request: Request, auth=Depends(require_auth)):
-    # ❌ ادمین فرعی دسترسی نداره
-    if auth["session"].get("user_type") == "sub_admin":
-        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
-    
+async def assign_link_to_sub(sub_id: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
     link_id = str(body.get("link_id", ""))
     action = str(body.get("action", "add"))
@@ -497,7 +487,8 @@ async def sub_group_subscription(uuid_key: str, request: Request):
         for lid in link_ids:
             link = LINKS.get(lid)
             if link and is_link_allowed(link):
-                lines.append(generate_vless_link(lid, host, remark=f"ARG-{link['label']}", protocol=link.get("protocol", DEFAULT_PROTOCOL)))
+                fp = link.get("fingerprint", "chrome")
+                lines.append(generate_vless_link(lid, host, remark=f"ARG-{link['label']}", protocol=link.get("protocol", DEFAULT_PROTOCOL), fingerprint=fp))
 
     content = base64.b64encode("\n".join(lines).encode()).decode()
     return Response(
@@ -532,33 +523,11 @@ async def api_logout(request: Request):
 
 @app.get("/api/me")
 async def api_me(request: Request):
-    session = await is_valid_session(request.cookies.get(SESSION_COOKIE))
-    return {"authenticated": session is not None}
+    return {"authenticated": await is_valid_session(request.cookies.get(SESSION_COOKIE))}
 
 @app.post("/api/change-password")
-async def api_change_password(request: Request, auth=Depends(require_auth)):
-    # ✅ هم ادمین اصلی هم فرعی (فقط رمز خودش)
+async def api_change_password(request: Request, _=Depends(require_auth)):
     body = await request.json()
-    session = auth["session"]
-    
-    # اگه ادمین فرعی باشه، رمزش رو از دیتابیس میخونیم
-    if session.get("user_type") == "sub_admin":
-        username = session.get("username")
-        async with SUB_ADMINS_LOCK:
-            admin = SUB_ADMINS.get(username)
-            if not admin:
-                raise HTTPException(status_code=404, detail="ادمین پیدا نشد")
-            if hash_password(str(body.get("current_password", ""))) != admin.get("password_hash"):
-                raise HTTPException(status_code=400, detail="رمز فعلی اشتباه است")
-            new = str(body.get("new_password", ""))
-            if len(new) < 4:
-                raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۴ کاراکتر باشد")
-            admin["password_hash"] = hash_password(new)
-            await save_state()
-            log_activity("sub_admin", f"ادمین فرعی «{username}» رمز خود را تغییر داد", "ok")
-            return {"ok": True}
-    
-    # ادمین اصلی
     if hash_password(str(body.get("current_password", ""))) != AUTH["password_hash"]:
         raise HTTPException(status_code=400, detail="رمز فعلی اشتباه است")
     new = str(body.get("new_password", ""))
@@ -566,9 +535,7 @@ async def api_change_password(request: Request, auth=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۴ کاراکتر باشد")
     AUTH["password_hash"] = hash_password(new)
     async with SESSIONS_LOCK:
-        for token, session_data in list(SESSIONS.items()):
-            if session_data.get("user_type") == "admin":
-                SESSIONS.pop(token, None)
+        SESSIONS.clear()
     token = await create_session()
     await save_state()
     log_activity("auth", "رمز عبور پنل تغییر کرد", "ok")
@@ -576,142 +543,9 @@ async def api_change_password(request: Request, auth=Depends(require_auth)):
     resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
     return resp
 
-# ── Sub-Admin Login ──────────────────────────────────────────────────────────
-@app.get("/admin_gigi", response_class=HTMLResponse)
-async def sub_admin_login_page(request: Request):
-    from pages import SUB_ADMIN_LOGIN_HTML
-    return HTMLResponse(content=SUB_ADMIN_LOGIN_HTML)
-
-@app.post("/api/sub-admin/login")
-async def sub_admin_login(request: Request):
-    body = await request.json()
-    username = str(body.get("username", "")).strip()
-    password = str(body.get("password", "")).strip()
-    ip = client_ip(request)
-    
-    async with SUB_ADMINS_LOCK:
-        admin = SUB_ADMINS.get(username)
-        if not admin:
-            log_activity("sub_admin_auth", f"تلاش ورود ناموفق (کاربر不存在) از {ip}", "err")
-            raise HTTPException(status_code=401, detail="نام کاربری یا رمز عبور اشتباه است")
-        if not admin.get("active", True):
-            raise HTTPException(status_code=403, detail="حساب کاربری غیرفعال است")
-        if hash_password(password) != admin.get("password_hash"):
-            log_activity("sub_admin_auth", f"تلاش ورود ناموفق (رمز اشتباه) از {ip}", "err")
-            raise HTTPException(status_code=401, detail="نام کاربری یا رمز عبور اشتباه است")
-        remaining = admin.get("quota_bytes", 0) - admin.get("used_bytes", 0)
-        if remaining <= 0:
-            log_activity("sub_admin_auth", f"تلاش ورود با سهمیه تمام شده از {ip}", "warn")
-            raise HTTPException(status_code=403, detail="سهمیه شما به پایان رسیده است")
-    
-    token = await create_session(user_type="sub_admin", username=username)
-    log_activity("sub_admin_auth", f"ورود موفق ادمین فرعی «{username}» از {ip}", "ok")
-    resp = JSONResponse({"ok": True, "user_type": "sub_admin", "username": username})
-    resp.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL, httponly=True, samesite="lax", path="/")
-    return resp
-
-@app.get("/api/sub-admin/status")
-async def sub_admin_status(auth=Depends(require_auth)):
-    # ✅ فقط ادمین فرعی
-    session = auth["session"]
-    if session.get("user_type") != "sub_admin":
-        raise HTTPException(status_code=403, detail="دسترسی فقط برای ادمین‌های فرعی")
-    username = session.get("username")
-    
-    async with SUB_ADMINS_LOCK:
-        admin = SUB_ADMINS.get(username)
-        if not admin:
-            raise HTTPException(status_code=404, detail="ادمین پیدا نشد")
-        quota = admin.get("quota_bytes", 0)
-        used = admin.get("used_bytes", 0)
-        remaining = quota - used
-        return {
-            "username": username,
-            "quota_bytes": quota,
-            "quota_fmt": fmt_bytes(quota),
-            "used_bytes": used,
-            "used_fmt": fmt_bytes(used),
-            "remaining_bytes": remaining if remaining > 0 else 0,
-            "remaining_fmt": fmt_bytes(remaining) if remaining > 0 else "۰",
-            "used_percent": round((used / quota) * 100) if quota > 0 else 0,
-            "is_exhausted": remaining <= 0,
-            "active": admin.get("active", True),
-        }
-
-# ── Sub-Admin Management (فقط ادمین اصلی) ──────────────────────────────────
-@app.post("/api/sub-admins")
-async def create_sub_admin(request: Request, auth=Depends(require_auth)):
-    # ❌ فقط ادمین اصلی
-    if auth["session"].get("user_type") == "sub_admin":
-        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
-    
-    body = await request.json()
-    username = str(body.get("username", "")).strip()
-    password = str(body.get("password", "")).strip()
-    quota_gb = float(body.get("quota_gb", 2))
-    
-    if not username or len(username) < 3:
-        raise HTTPException(status_code=400, detail="نام کاربری حداقل ۳ کاراکتر")
-    if not password or len(password) < 4:
-        raise HTTPException(status_code=400, detail="رمز عبور حداقل ۴ کاراکتر")
-    if quota_gb < 0.1:
-        raise HTTPException(status_code=400, detail="سهمیه باید حداقل ۰.۱ گیگ باشد")
-    
-    async with SUB_ADMINS_LOCK:
-        if username in SUB_ADMINS:
-            raise HTTPException(status_code=400, detail="این نام کاربری قبلاً ثبت شده")
-        SUB_ADMINS[username] = {
-            "password_hash": hash_password(password),
-            "quota_bytes": int(quota_gb * 1024 ** 3),
-            "used_bytes": 0,
-            "created_at": datetime.now().isoformat(),
-            "active": True,
-        }
-    
-    asyncio.create_task(save_state())
-    log_activity("sub_admin", f"ادمین فرعی «{username}» با سهمیه {quota_gb}GB ساخته شد", "ok")
-    return {"ok": True, "username": username, "quota_gb": quota_gb}
-
-@app.get("/api/sub-admins")
-async def list_sub_admins(auth=Depends(require_auth)):
-    # ❌ فقط ادمین اصلی - ادمین فرعی نبینه
-    if auth["session"].get("user_type") == "sub_admin":
-        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
-    
-    async with SUB_ADMINS_LOCK:
-        result = []
-        for username, data in SUB_ADMINS.items():
-            quota = data.get("quota_bytes", 0)
-            used = data.get("used_bytes", 0)
-            result.append({
-                "username": username,
-                "quota_gb": round(quota / 1024**3, 2),
-                "used_gb": round(used / 1024**3, 2),
-                "remaining_gb": round((quota - used) / 1024**3, 2),
-                "used_percent": round((used / quota) * 100) if quota > 0 else 0,
-                "created_at": data.get("created_at"),
-                "active": data.get("active", True),
-            })
-        return {"sub_admins": result}
-
-@app.delete("/api/sub-admins/{username}")
-async def delete_sub_admin(username: str, auth=Depends(require_auth)):
-    # ❌ فقط ادمین اصلی
-    if auth["session"].get("user_type") == "sub_admin":
-        raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
-    
-    async with SUB_ADMINS_LOCK:
-        if username not in SUB_ADMINS:
-            raise HTTPException(status_code=404, detail="ادمین پیدا نشد")
-        del SUB_ADMINS[username]
-    asyncio.create_task(save_state())
-    log_activity("sub_admin", f"ادمین فرعی «{username}» حذف شد", "warn")
-    return {"ok": True}
-
 # ── Stats ─────────────────────────────────────────────────────────────────────
 @app.get("/stats")
-async def get_stats(auth=Depends(require_auth)):
-    # ✅ هم ادمین اصلی هم فرعی میتونن ببینن
+async def get_stats(_=Depends(require_auth)):
     async with LINKS_LOCK:
         snap = dict(LINKS)
     return {
@@ -731,14 +565,12 @@ async def get_stats(auth=Depends(require_auth)):
 
 # ── Activity Logs ─────────────────────────────────────────────────────────────
 @app.get("/api/activity")
-async def get_activity(auth=Depends(require_auth)):
-    # ✅ هم ادمین اصلی هم فرعی میتونن ببینن
+async def get_activity(_=Depends(require_auth)):
     return {"logs": list(activity_logs)[-150:]}
 
 # ── Live connections ──────────────────────────────────────────────────────────
 @app.get("/api/connections")
-async def get_connections(auth=Depends(require_auth)):
-    # ✅ هم ادمین اصلی هم فرعی میتونن ببینن
+async def get_connections(_=Depends(require_auth)):
     async with LINKS_LOCK:
         snap = dict(LINKS)
 
@@ -793,8 +625,7 @@ async def get_connections(auth=Depends(require_auth)):
 
 # ── Link Management ───────────────────────────────────────────────────────────
 @app.post("/api/links")
-async def create_link(request: Request, auth=Depends(require_auth)):
-    # ✅ هم ادمین اصلی هم فرعی (ادمین فرعی با سهمیه)
+async def create_link(request: Request, _=Depends(require_auth)):
     body = await request.json()
     label = (body.get("label") or "لینک جدید").strip()[:60]
     lv = float(body.get("limit_value") or 0)
@@ -807,18 +638,9 @@ async def create_link(request: Request, auth=Depends(require_auth)):
     protocol = body.get("protocol") or DEFAULT_PROTOCOL
     if protocol not in PROTOCOLS:
         protocol = DEFAULT_PROTOCOL
-
-    created_by = None
-    session = auth["session"]
-    if session.get("user_type") == "sub_admin":
-        username = session.get("username")
-        created_by = username
-        async with SUB_ADMINS_LOCK:
-            admin = SUB_ADMINS.get(username)
-            if admin:
-                remaining = admin.get("quota_bytes", 0) - admin.get("used_bytes", 0)
-                if remaining <= 0:
-                    raise HTTPException(status_code=403, detail="سهمیه شما به پایان رسیده است")
+    
+    max_devices = int(body.get("max_devices", 0))
+    fingerprint = body.get("fingerprint", "chrome")
 
     uid = generate_uuid()
     async with LINKS_LOCK:
@@ -833,7 +655,8 @@ async def create_link(request: Request, auth=Depends(require_auth)):
             "is_default": False,
             "sub_id": sub_id,
             "protocol": protocol,
-            "created_by": created_by,
+            "max_devices": max_devices,
+            "fingerprint": fingerprint,
         }
 
     if sub_id:
@@ -850,44 +673,39 @@ async def create_link(request: Request, auth=Depends(require_auth)):
         "uuid": uid,
         **LINKS[uid],
         "expired": False,
-        "vless_link": generate_vless_link(uid, host, remark=f"ARG-{label}", protocol=protocol),
+        "vless_link": generate_vless_link(uid, host, remark=f"ARG-{label}", protocol=protocol, fingerprint=fingerprint),
         "sub_url": f"https://{host}/sub/{uid}",
     }
 
 @app.get("/api/links")
-async def list_links(auth=Depends(require_auth)):
-    # ✅ هم ادمین اصلی هم فرعی میتونن همه کانفیگ‌ها رو ببینن
+async def list_links(_=Depends(require_auth)):
     host = get_host()
     async with LINKS_LOCK:
         snap = dict(LINKS)
-    
     result = []
     for uid, d in snap.items():
         proto = d.get("protocol", DEFAULT_PROTOCOL)
+        fp = d.get("fingerprint", "chrome")
         result.append({
             "uuid": uid,
             **d,
             "protocol": proto,
+            "fingerprint": fp,
+            "max_devices": d.get("max_devices", 0),
             "expired": is_link_expired(d),
-            "vless_link": generate_vless_link(uid, host, remark=f"ARG-{d['label']}", protocol=proto),
+            "vless_link": generate_vless_link(uid, host, remark=f"ARG-{d['label']}", protocol=proto, fingerprint=fp),
             "sub_url": f"https://{host}/sub/{uid}",
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
 
 @app.patch("/api/links/{uid}")
-async def update_link(uid: str, request: Request, auth=Depends(require_auth)):
-    # ✅ ادمین اصلی همه رو ویرایش کنه، ادمین فرعی فقط کانفیگ‌های خودش
+async def update_link(uid: str, request: Request, _=Depends(require_auth)):
     body = await request.json()
     async with LINKS_LOCK:
         if uid not in LINKS:
             raise HTTPException(status_code=404, detail="link not found")
         link = LINKS[uid]
-        
-        if auth["session"].get("user_type") == "sub_admin":
-            if link.get("created_by") != auth["session"].get("username"):
-                raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
-        
         old_sub = link.get("sub_id")
         label = link.get("label")
         if "active" in body:
@@ -907,7 +725,11 @@ async def update_link(uid: str, request: Request, auth=Depends(require_auth)):
         if "expires_days" in body:
             ed = int(body["expires_days"] or 0)
             link["expires_at"] = (datetime.now() + timedelta(days=ed)).isoformat() if ed > 0 else None
-        if any(k in body for k in ("label", "note", "limit_value", "expires_days")):
+        if "max_devices" in body:
+            link["max_devices"] = int(body["max_devices"])
+        if "fingerprint" in body:
+            link["fingerprint"] = str(body["fingerprint"])
+        if any(k in body for k in ("label", "note", "limit_value", "expires_days", "max_devices", "fingerprint")):
             log_activity("link", f"کانفیگ «{link['label']}» ویرایش شد", "info")
         new_sub = body.get("sub_id", "UNCHANGED")
         if new_sub != "UNCHANGED":
@@ -928,16 +750,10 @@ async def update_link(uid: str, request: Request, auth=Depends(require_auth)):
     return {"ok": True}
 
 @app.delete("/api/links/{uid}")
-async def delete_link(uid: str, auth=Depends(require_auth)):
-    # ✅ ادمین اصلی همه رو حذف کنه، ادمین فرعی فقط کانفیگ‌های خودش
+async def delete_link(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
         if uid not in LINKS:
             raise HTTPException(status_code=404, detail="link not found")
-        
-        if auth["session"].get("user_type") == "sub_admin":
-            if LINKS[uid].get("created_by") != auth["session"].get("username"):
-                raise HTTPException(status_code=403, detail="دسترسی غیرمجاز")
-        
         label = LINKS[uid].get("label", uid)
         sub_id = LINKS[uid].get("sub_id")
         del LINKS[uid]
@@ -1033,17 +849,20 @@ async def public_sub_data(uuid_key: str, request: Request):
         conn_count = sum(1 for c in connections.values() if c.get("uuid") == lid)
         active_conns += conn_count
         proto = link.get("protocol", DEFAULT_PROTOCOL)
+        fp = link.get("fingerprint", "chrome")
         links_out.append({
             "uuid": lid,
             "label": link["label"],
             "active": allowed,
             "protocol": proto,
+            "fingerprint": fp,
+            "max_devices": link.get("max_devices", 0),
             "used_bytes": link.get("used_bytes", 0),
             "used_fmt": fmt_bytes(link.get("used_bytes", 0)),
             "limit_bytes": link.get("limit_bytes", 0),
             "limit_fmt": "∞" if link.get("limit_bytes", 0) == 0 else fmt_bytes(link["limit_bytes"]),
             "expires_at": link.get("expires_at"),
-            "vless_link": generate_vless_link(lid, host, remark=f"ARG-{link['label']}", protocol=proto),
+            "vless_link": generate_vless_link(lid, host, remark=f"ARG-{link['label']}", protocol=proto, fingerprint=fp),
             "sub_url": f"https://{host}/sub/{lid}",
             "connections": conn_count,
         })
@@ -1070,8 +889,7 @@ async def login_page(request: Request):
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    session = await is_valid_session(request.cookies.get(SESSION_COOKIE))
-    if not session:
+    if not await is_valid_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse(url="/login")
     await ensure_default_link()
     return HTMLResponse(content=DASHBOARD_HTML)
